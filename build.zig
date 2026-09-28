@@ -5,10 +5,23 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
 
     // public module
-    _ = b.addModule("ziggurat", .{
+    const mod = b.addModule("ziggurat", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
     });
+
+    // build docs
+    const lib = b.addLibrary(.{
+        .name = "ziggurat",
+        .root_module = mod,
+    });
+    const install_docs = b.addInstallDirectory(.{
+        .source_dir = lib.getEmittedDocs(),
+        .install_dir = .prefix,
+        .install_subdir = "docs",
+    });
+    const docs_step = b.step("docs", "Generate API docs");
+    docs_step.dependOn(&install_docs.step);
 
     // compiles tests and runs
     const tests = b.addTest(.{
@@ -18,8 +31,23 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
-
     const run_tests = b.addRunArtifact(tests);
     const test_step = b.step("test", "Run all tests");
     test_step.dependOn(&run_tests.step);
+
+    // runs benchmarks to compare speed
+    const bench_exe = b.addExecutable(.{
+        .name = "bench",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("bench/benchmarks.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+            .imports = &.{
+                .{ .name = "ziggurat", .module = mod },
+            },
+        }),
+    });
+    const run_bench = b.addRunArtifact(bench_exe);
+    const bench_step = b.step("bench", "Run benchmarks (builds with ReleaseFast)");
+    bench_step.dependOn(&run_bench.step);
 }
