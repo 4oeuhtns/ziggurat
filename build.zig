@@ -35,6 +35,19 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run all tests");
     test_step.dependOn(&run_tests.step);
 
+    // fuzz the tests, always in ReleaseSafe
+    // (safety checks on; also Zig 0.16.0 can't fuzz in Debug).
+    const fuzz_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/root.zig"),
+            .target = target,
+            .optimize = .ReleaseSafe,
+        }),
+    });
+    const run_fuzz_tests = b.addRunArtifact(fuzz_tests);
+    const fuzz_step = b.step("fuzz", "Fuzz tests in ReleaseSafe");
+    fuzz_step.dependOn(&run_fuzz_tests.step);
+
     // runs benchmarks to compare speed
     const bench_exe = b.addExecutable(.{
         .name = "bench",
