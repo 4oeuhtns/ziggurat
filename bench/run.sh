@@ -1,3 +1,4 @@
+#!/bin/sh
 # tests load on server in Lima
 # save in bench/results/, tagged with git commit
 #

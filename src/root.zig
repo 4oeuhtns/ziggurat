@@ -1,4 +1,4 @@
-//! Ziggurat: a web framework that implements every layer of the web in zig
+//! ziggurat: a web framework that implements every layer of the web in zig
 
 const std = @import("std");
 pub const http = @import("http.zig");

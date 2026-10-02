@@ -63,4 +63,21 @@ pub fn build(b: *std.Build) void {
     const run_bench = b.addRunArtifact(bench_exe);
     const bench_step = b.step("bench", "Run benchmarks (builds with ReleaseFast)");
     bench_step.dependOn(&run_bench.step);
+
+    // example server: zig build hello
+    const hello_exe = b.addExecutable(.{
+        .name = "hello",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("examples/hello/main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "ziggurat", .module = mod },
+            },
+        }),
+    });
+    b.installArtifact(hello_exe);
+    const run_hello = b.addRunArtifact(hello_exe);
+    const hello_step = b.step("hello", "Run the hello example server");
+    hello_step.dependOn(&run_hello.step);
 }

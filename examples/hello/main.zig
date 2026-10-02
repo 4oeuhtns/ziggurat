@@ -1,0 +1,54 @@
+//! test web server: answers requests with "Hello, World!"
+
+const std = @import("std");
+const Io = std.Io;
+const ziggurat = @import("ziggurat");
+
+const response =
+    "HTTP/1.1 200 OK\r\n" ++
+    "Content-Type: text/plain\r\n" ++
+    "Content-Length: 14\r\n" ++
+    "Connection: close\r\n" ++
+    "\r\n" ++
+    "Hello, World!\n";
+
+pub fn main(init: std.process.Init) !void {
+    const io = init.io;
+
+    const address = try Io.net.IpAddress.parse("127.0.0.1", 3000);
+    var server = try address.listen(io, .{ .reuse_address = true });
+    defer server.deinit(io);
+    std.log.info("listening on http://{f}/", .{address});
+
+    while (true) {
+        const stream = server.accept(io) catch |err| {
+            std.log.warn("accep failed: {t}", .{err});
+            continue;
+        };
+        handleConnection(io, stream) catch |err| {
+            std.log.warn("connection failed: {t}", .{err});
+        };
+    }
+}
+
+fn handleConnection(io: Io, stream: Io.net.Stream) !void {
+    defer stream.close(io);
+
+    var read_buffer: [4096]u8 = undefined;
+    var stream_reader = stream.reader(io, &read_buffer);
+    const reader = &stream_reader.interface;
+
+    // read until entire request head arrives
+    const head_len = while (true) {
+        if (ziggurat.http.findHeadEnd(reader.buffered())) |len| break len;
+        if (reader.bufferedLen() == read_buffer.len) return error.HeadTooLarge;
+        try reader.fillMore();
+    };
+    std.log.info("request:\n{s}", .{reader.buffered()[0..head_len]});
+
+    var write_buffer: [1024]u8 = undefined;
+    var stream_writer = stream.writer(io, &write_buffer);
+    const writer = &stream_writer.interface;
+    try writer.writeAll(response);
+    try writer.flush();
+}
