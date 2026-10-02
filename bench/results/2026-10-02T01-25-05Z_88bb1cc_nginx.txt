@@ -1,0 +1,23 @@
+name=nginx
+url=http://localhost:8080/
+commit=88bb1cc
+date=2026-10-02T01-25-05Z
+wrk_args=-t2 -c64 -d10s
+
+Running 10s test @ http://localhost:8080/
+  2 threads and 64 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency   221.61us  436.35us   6.86ms   90.26%
+    Req/Sec   206.67k    10.34k  234.79k    77.11%
+  Latency Distribution
+     50%   73.00us
+     75%  136.00us
+     90%  628.00us
+     99%    2.21ms
+  4133016 requests in 10.10s, 673.99MB read
+Requests/sec: 409280.95
+Transfer/sec:     66.74MB
+requests_per_sec=409280
+p50_us=73
+p99_us=2211
+errors=0
