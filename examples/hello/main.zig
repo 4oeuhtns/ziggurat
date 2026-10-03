@@ -3,6 +3,7 @@
 const std = @import("std");
 const Io = std.Io;
 const ziggurat = @import("ziggurat");
+const http = ziggurat.http;
 
 const response =
     "HTTP/1.1 200 OK\r\n" ++
@@ -54,11 +55,13 @@ fn handleConnection(io: Io, stream: Io.net.Stream) !void {
 
     // read until entire request head arrives
     const head_len = while (true) {
-        if (ziggurat.http.findHeadEnd(reader.buffered())) |len| break len;
+        if (http.Request.findHeadEnd(reader.buffered())) |len| break len;
         if (reader.bufferedLen() == read_buffer.len) return error.HeadTooLarge;
         try reader.fillMore();
     };
-    std.log.info("request:\n{s}", .{reader.buffered()[0..head_len]});
+    var header_buf: [64]http.Request.Header = undefined;
+    const request = try http.Request.parse(reader.buffered()[0..head_len], &header_buf);
+    std.log.info("{t} {s} {t}, {d} headers", .{ request.method, request.target, request.version, request.headers.len });
 
     var write_buffer: [1024]u8 = undefined;
     var stream_writer = stream.writer(io, &write_buffer);

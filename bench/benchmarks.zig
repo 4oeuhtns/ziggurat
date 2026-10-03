@@ -1,6 +1,7 @@
 const std = @import("std");
 const Io = std.Io;
 const ziggurat = @import("ziggurat");
+const http = ziggurat.http;
 
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
@@ -11,7 +12,7 @@ pub fn main(init: std.process.Init) !void {
     const start = Io.Clock.awake.now(io);
     for (0..iters) |_| {
         std.mem.doNotOptimizeAway(&request);
-        std.mem.doNotOptimizeAway(ziggurat.http.findHeadEnd(&request));
+        std.mem.doNotOptimizeAway(http.Request.findHeadEnd(&request));
     }
     const elapsed = start.untilNow(io, .awake);
 
