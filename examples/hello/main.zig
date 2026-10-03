@@ -13,22 +13,36 @@ const response =
     "Hello, World!\n";
 
 pub fn main(init: std.process.Init) !void {
-    const io = init.io;
+    try serve(init.io);
+}
 
+/// accepts connections with each as its own task
+fn serve(io: Io) !void {
     const address = try Io.net.IpAddress.parse("127.0.0.1", 3000);
     var server = try address.listen(io, .{ .reuse_address = true });
     defer server.deinit(io);
     std.log.info("listening on http://{f}/", .{address});
 
+    var group: Io.Group = .init;
+    defer group.cancel(io);
+
     while (true) {
         const stream = server.accept(io) catch |err| {
-            std.log.warn("accep failed: {t}", .{err});
+            std.log.warn("accept failed: {t}", .{err});
             continue;
         };
-        handleConnection(io, stream) catch |err| {
-            std.log.warn("connection failed: {t}", .{err});
+        group.concurrent(io, serveConnection, .{ io, stream }) catch |err| {
+            std.log.warn("can't start connection task: {t}", .{err});
+            stream.close(io);
         };
     }
+}
+
+/// runs connection as own task, concurrent tasks cant return errors, so logged here then returns void
+fn serveConnection(io: Io, stream: Io.net.Stream) void {
+    handleConnection(io, stream) catch |err| {
+        std.log.warn("connection failed: {t}", .{err});
+    };
 }
 
 fn handleConnection(io: Io, stream: Io.net.Stream) !void {
