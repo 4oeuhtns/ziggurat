@@ -13,6 +13,9 @@ const response =
     "\r\n" ++
     "Hello, World!\n";
 
+/// biggest request body we accept
+const max_body = 1024 * 1024;
+
 pub fn main(init: std.process.Init) !void {
     try serve(init.io);
 }
@@ -61,7 +64,17 @@ fn handleConnection(io: Io, stream: Io.net.Stream) !void {
     };
     var header_buf: [64]http.Request.Header = undefined;
     const request = try http.Request.parse(reader.buffered()[0..head_len], &header_buf);
-    std.log.info("{t} {s} {t}, {d} headers", .{ request.method, request.target, request.version, request.headers.len });
+    std.log.info("{t} {s} {t}, {d} headers, body: {any}", .{ request.method, request.target, request.version, request.headers.len, request.body });
+
+    reader.toss(head_len);
+    switch (request.body) {
+        .none => {},
+        .length => |n| {
+            if (n > max_body) return error.BodyTooLarge;
+            try reader.discardAll(@intCast(n));
+        },
+        .chunked => return error.ChunkedNotSupportedYet,
+    }
 
     var write_buffer: [1024]u8 = undefined;
     var stream_writer = stream.writer(io, &write_buffer);

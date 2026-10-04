@@ -9,6 +9,7 @@ method: Method,
 target: []const u8,
 version: Version,
 headers: []const Header,
+body: Body,
 
 pub const Method = enum { GET, HEAD, POST, PUT, DELETE, CONNECT, OPTIONS, TRACE, PATCH };
 pub const Version = enum { @"HTTP/1.0", @"HTTP/1.1" };
@@ -16,6 +17,16 @@ pub const Version = enum { @"HTTP/1.0", @"HTTP/1.1" };
 pub const Header = struct {
     name: []const u8,
     value: []const u8,
+};
+
+/// how the request says where the body ends (RFC 9112 section 6.3)
+pub const Body = union(enum) {
+    /// no body
+    none,
+    /// exactly this many bytes after head
+    length: u64,
+    /// chunks, ending with size zero chunk
+    chunked,
 };
 
 /// error types
@@ -32,6 +43,12 @@ pub const ParseError = error{
     TooManyHeaders,
     /// `head` doesn't end with blank line
     IncompleteHead,
+    /// `content-length` isn't digits, too big, or appears more than once
+    BadContentLength,
+    /// body length can be read in 2 ways
+    AmbiguousFraming,
+    /// `transfer-encoding` is something other than `chunked`
+    UnsupportedTransferEncoding,
 };
 
 /// Returns index just after HTTP head (`\r\n\r\n`), or `null`
@@ -71,10 +88,22 @@ pub fn parse(head: []const u8, header_buf: []Header) ParseError!Request {
 
     // header lines
     var i: usize = 0;
+    var content_length: ?u64 = null;
+    var chunked = false;
     while (lines.next()) |line| {
         if (i == header_buf.len) return error.TooManyHeaders;
-        header_buf[i] = try parseHeader(line);
+        const h = try parseHeader(line);
+        header_buf[i] = h;
         i += 1;
+
+        if (std.ascii.eqlIgnoreCase(h.name, "content-length")) {
+            if (content_length != null) return error.BadContentLength; // check multiple content lengths
+            content_length = try parseContentLength(h.value);
+        } else if (std.ascii.eqlIgnoreCase(h.name, "transfer-encoding")) {
+            if (chunked) return error.AmbiguousFraming; // multiple transfer-encoding
+            if (!std.ascii.eqlIgnoreCase(h.value, "chunked")) return error.UnsupportedTransferEncoding;
+            chunked = true;
+        }
     }
 
     return .{
@@ -82,6 +111,7 @@ pub fn parse(head: []const u8, header_buf: []Header) ParseError!Request {
         .target = target,
         .version = version,
         .headers = header_buf[0..i],
+        .body = try bodyFraming(version, content_length, chunked),
     };
 }
 
@@ -108,6 +138,22 @@ fn parseHeader(line: []const u8) ParseError!Header {
     return .{ .name = name, .value = value };
 }
 
+/// `content-length` is one or more digits only (RFC 9110 section 8.6)
+fn parseContentLength(value: []const u8) ParseError!u64 {
+    if (value.len == 0) return error.BadContentLength;
+    var n: u64 = 0;
+    for (value) |c| {
+        const digit = switch (c) {
+            '0'...'9' => c - '0',
+            else => return error.BadContentLength,
+        };
+        // not standard *10 and +, catch any errors
+        n = std.math.mul(u64, n, 10) catch return error.BadContentLength;
+        n = std.math.add(u64, n, digit) catch return error.BadContentLength;
+    }
+    return n;
+}
+
 // a 'token' is one ore more of these characters only (RFC 9110 section 5.6.2)
 fn isToken(text: []const u8) bool {
     if (text.len == 0) return false;
@@ -121,8 +167,18 @@ fn isToken(text: []const u8) bool {
     return true;
 }
 
-// Tests
+/// decides how body ends, rejects anything 2 different servers can read differently
+fn bodyFraming(version: Version, content_length: ?u64, chunked: bool) ParseError!Body {
+    if (chunked) {
+        if (content_length != null) return error.AmbiguousFraming; // both content-length and transfer-encoding
+        if (version == .@"HTTP/1.0") return error.AmbiguousFraming; // HTTP/1.0 has no chunked
+        return .chunked;
+    }
+    if (content_length) |n| return .{ .length = n };
+    return .none;
+}
 
+// Tests
 test findHeadEnd {
     try std.testing.expectEqual(18, findHeadEnd("GET / HTTP/1.1\r\n\r\n"));
     try std.testing.expectEqual(null, findHeadEnd("GET / HTTP/1.1\r\n"));
@@ -145,7 +201,7 @@ fn fuzzFindHeadEnd(_: void, smith: *std.testing.Smith) !void {
     try std.testing.expectEqual(findHeadEndSlow(input), findHeadEnd(input));
 }
 
-test "fuzz findHeadEnd against slow version" {
+test "fuzz findHeadEnd" {
     try std.testing.fuzz({}, fuzzFindHeadEnd, .{
         .corpus = &.{
             sliceSeed("GET / HTTP/1.1\r\n\r\n"),
@@ -239,6 +295,14 @@ fn fuzzParse(_: void, smith: *std.testing.Smith) !void {
         try expectClean(input, h.name);
         try expectClean(input, h.value);
     }
+
+    // at most one header may say how long the body is
+    var framing_headers: usize = 0;
+    for (request.headers) |h| {
+        if (std.ascii.eqlIgnoreCase(h.name, "content-length")) framing_headers += 1;
+        if (std.ascii.eqlIgnoreCase(h.name, "transfer-encoding")) framing_headers += 1;
+    }
+    try std.testing.expect(framing_headers <= 1);
 }
 
 fn expectClean(input: []const u8, part: []const u8) !void {
@@ -253,6 +317,65 @@ test "fuzz parse" {
         .corpus = &.{
             sliceSeed("GET / HTTP/1.1\r\nHost: a"),
             sliceSeed("POST /x?y=1 HTTP/1.0\r\nContent-Length: 5\r\nX: \t v "),
+            sliceSeed("POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\nContent-Length: 5"),
         },
     });
+}
+
+test "body framing" {
+    const cases = [_]struct { []const u8, Body }{
+        .{ "GET / HTTP/1.1\r\n\r\n", .none },
+        .{ "POST / HTTP/1.1\r\nContent-Length: 5\r\n\r\n", .{ .length = 5 } },
+        .{ "POST / HTTP/1.1\r\ncontent-length: 0\r\n\r\n", .{ .length = 0 } },
+        .{ "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n", .chunked },
+        .{ "POST / HTTP/1.1\r\nTransfer-Encoding: Chunked\r\n\r\n", .chunked }, // names of codings ignore case
+    };
+    for (cases) |case| {
+        const input, const expected = case;
+        errdefer std.debug.print("failed on: \"{f}\"\n", .{std.zig.fmtString(input)});
+        var header_buf: [8]Header = undefined;
+        const request = try parse(input, &header_buf);
+        try std.testing.expectEqual(expected, request.body);
+    }
+}
+
+test "rejects ambiguous framing" {
+    const cases = [_]struct { []const u8, ParseError }{
+        .{ "POST / HTTP/1.1\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n", error.AmbiguousFraming },
+        .{ "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\nContent-Length: 5\r\n\r\n", error.AmbiguousFraming },
+        .{ "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\nTransfer-Encoding: chunked\r\n\r\n", error.AmbiguousFraming },
+        .{ "POST / HTTP/1.0\r\nTransfer-Encoding: chunked\r\n\r\n", error.AmbiguousFraming },
+        .{ "POST / HTTP/1.1\r\nContent-Length: 5\r\nContent-Length: 5\r\n\r\n", error.BadContentLength },
+        .{ "POST / HTTP/1.1\r\nContent-Length: 5, 5\r\n\r\n", error.BadContentLength },
+        .{ "POST / HTTP/1.1\r\nContent-Length: +5\r\n\r\n", error.BadContentLength },
+        .{ "POST / HTTP/1.1\r\nContent-Length: 1_000\r\n\r\n", error.BadContentLength },
+        .{ "POST / HTTP/1.1\r\nContent-Length: -1\r\n\r\n", error.BadContentLength },
+        .{ "POST / HTTP/1.1\r\nContent-Length: 0x10\r\n\r\n", error.BadContentLength },
+        .{ "POST / HTTP/1.1\r\nContent-Length:\r\n\r\n", error.BadContentLength },
+        .{ "POST / HTTP/1.1\r\nContent-Length: 99999999999999999999\r\n\r\n", error.BadContentLength }, // too big for u64
+        .{ "POST / HTTP/1.1\r\nTransfer-Encoding: gzip\r\n\r\n", error.UnsupportedTransferEncoding },
+        .{ "POST / HTTP/1.1\r\nTransfer-Encoding: gzip, chunked\r\n\r\n", error.UnsupportedTransferEncoding },
+    };
+    for (cases) |case| {
+        const input, const expected = case;
+        errdefer std.debug.print("failed on: \"{f}\"\n", .{std.zig.fmtString(input)});
+        var header_buf: [8]Header = undefined;
+        try std.testing.expectError(expected, parse(input, &header_buf));
+    }
+}
+
+test "two pipelined requests in one buffer" {
+    const bytes = "POST /a HTTP/1.1\r\nContent-Length: 5\r\n\r\nhelloGET /b HTTP/1.1\r\n\r\n";
+
+    var first_headers: [8]Header = undefined;
+    const first_head_len = findHeadEnd(bytes).?;
+    const first = try parse(bytes[0..first_head_len], &first_headers);
+    const body_end = first_head_len + first.body.length;
+    try std.testing.expectEqualStrings("hello", bytes[first_head_len..body_end]);
+
+    const rest = bytes[body_end..];
+    var second_headers: [8]Header = undefined;
+    const second = try parse(rest[0..findHeadEnd(rest).?], &second_headers);
+    try std.testing.expectEqual(.GET, second.method);
+    try std.testing.expectEqualStrings("/b", second.target);
 }
