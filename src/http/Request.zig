@@ -2,6 +2,7 @@
 //! zero copy, returns slices pointing to bytes
 
 const std = @import("std");
+const chars = @import("chars.zig");
 const sliceSeed = @import("../fuzz.zig").sliceSeed;
 const Request = @This();
 
@@ -130,10 +131,7 @@ fn parseHeader(line: []const u8) ParseError!Header {
 
     const value = std.mem.trim(u8, rest, " \t");
     for (value) |c| {
-        switch (c) {
-            '\t', ' '...'~', 0x80...0xff => {},
-            else => return error.BadHeader, // control bytes
-        }
+        if (!chars.isValueChar(c)) return error.BadHeader;
     }
     return .{ .name = name, .value = value };
 }
@@ -158,11 +156,7 @@ fn parseContentLength(value: []const u8) ParseError!u64 {
 fn isToken(text: []const u8) bool {
     if (text.len == 0) return false;
     for (text) |c| {
-        switch (c) {
-            'a'...'z', 'A'...'Z', '0'...'9' => {},
-            '!', '#', '$', '%', '&', '\'', '*', '+', '-', '.', '^', '_', '`', '|', '~' => {},
-            else => return false,
-        }
+        if (!chars.isTokenChar(c)) return false;
     }
     return true;
 }

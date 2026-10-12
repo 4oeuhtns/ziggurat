@@ -73,7 +73,17 @@ fn handleConnection(io: Io, stream: Io.net.Stream) !void {
             if (n > max_body) return error.BodyTooLarge;
             try reader.discardAll(@intCast(n));
         },
-        .chunked => return error.ChunkedNotSupportedYet,
+        .chunked => {
+            // counts every byte, not just data so large extensions or trailer can't go over `max_body`
+            var decoder: http.ChunkedDecoder = .{};
+            var used: usize = 0;
+            while (!decoder.isDone()) {
+                const step = try decoder.feed((try reader.peekGreedy(1)));
+                reader.toss(step.consumed);
+                used += step.consumed;
+                if (used > max_body) return error.BodyTooLarge;
+            }
+        },
     }
 
     var write_buffer: [1024]u8 = undefined;
