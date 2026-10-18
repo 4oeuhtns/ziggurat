@@ -124,6 +124,27 @@ pub fn header(request: Request, name: []const u8) ?[]const u8 {
     return null;
 }
 
+/// whether the client wants the connection to be kept open (RFC 9112 section 9.3)
+/// HTTP/1.1 stays open unless told `close`, HTTP/1.0 closes unless told `keep-alive`
+pub fn keepAlive(request: Request) bool {
+    var close = false;
+    var keep_alive = false;
+    for (request.headers) |h| {
+        if (!std.ascii.eqlIgnoreCase(h.name, "connection")) continue;
+        var options = std.mem.splitScalar(u8, h.value, ',');
+        while (options.next()) |option| {
+            const o = std.mem.trim(u8, option, " \t");
+            if (std.ascii.eqlIgnoreCase(o, "close")) close = true;
+            if (std.ascii.eqlIgnoreCase(o, "keep-alive")) keep_alive = true;
+        }
+    }
+    if (close) return false;
+    return switch (request.version) {
+        .@"HTTP/1.0" => keep_alive,
+        .@"HTTP/1.1" => true,
+    };
+}
+
 /// `name: whitespace value whitespace`
 fn parseHeader(line: []const u8) ParseError!Header {
     const name, const rest = std.mem.cutScalar(u8, line, ':') orelse return error.BadHeader;
@@ -233,6 +254,27 @@ test header {
 
     try std.testing.expectEqualStrings("text/plain", request.header("content-type").?);
     try std.testing.expectEqual(null, request.header("host"));
+}
+
+test keepAlive {
+    const cases = [_]struct { []const u8, bool }{
+        .{ "GET / HTTP/1.1\r\n\r\n", true },
+        .{ "GET / HTTP/1.1\r\nConnection: close\r\n\r\n", false },
+        .{ "GET / HTTP/1.1\r\nConnection: Close\r\n\r\n", false },
+        .{ "GET / HTTP/1.1\r\nConnection: keep-alive, close\r\n\r\n", false }, // close wins
+        .{ "GET / HTTP/1.1\r\nConnection: Upgrade\r\nConnection: close\r\n\r\n", false }, // second header counts too
+        .{ "GET / HTTP/1.1\r\nConnection: , close ,\r\n\r\n", false }, // empty list items are allowed
+        .{ "GET / HTTP/1.1\r\nConnection: closed\r\n\r\n", true }, // not the word `close`
+        .{ "GET / HTTP/1.0\r\n\r\n", false },
+        .{ "GET / HTTP/1.0\r\nConnection: Keep-Alive\r\n\r\n", true },
+    };
+    for (cases) |case| {
+        const input, const expected = case;
+        errdefer std.debug.print("failed on: \"{f}\"\n", .{std.zig.fmtString(input)});
+        var header_buf: [8]Header = undefined;
+        const request = try parse(input, &header_buf);
+        try std.testing.expectEqual(expected, request.keepAlive());
+    }
 }
 
 test "whitespace around header values is trimmed" {
