@@ -4,9 +4,17 @@ const std = @import("std");
 const Io = std.Io;
 const ziggurat = @import("ziggurat");
 const http = ziggurat.http;
+const net = ziggurat.net;
 
 const keep_alive_response = response("keep-alive");
 const close_response = response("close");
+
+/// how long a connection may wait for its next request
+const idle_timeout: Io.Duration = .fromSeconds(10);
+/// how long the whole request head may take to arrive
+const head_timeout: Io.Duration = .fromSeconds(5);
+/// how long the whole body may take to arrive
+const body_timeout: Io.Duration = .fromSeconds(10);
 
 /// biggest request body we accept
 const max_body = 1024 * 1024;
@@ -58,8 +66,7 @@ fn handleConnection(io: Io, stream: Io.net.Stream) !void {
     defer stream.close(io);
 
     var read_buffer: [4096]u8 = undefined;
-    var stream_reader = stream.reader(io, &read_buffer);
-    const reader = &stream_reader.interface;
+    var timeout_reader = net.TimeoutReader.init(stream, io, &read_buffer);
 
     var write_buffer: [1024]u8 = undefined;
     var stream_writer = stream.writer(io, &write_buffer);
@@ -67,23 +74,37 @@ fn handleConnection(io: Io, stream: Io.net.Stream) !void {
 
     defer writer.flush() catch {};
 
-    while (try handleRequest(reader, writer)) {}
+    // not just try, return correct errors from timeout reader
+    while (handleRequest(&timeout_reader, writer) catch |err| switch (err) {
+        error.ReadFailed => return timeout_reader.err.?,
+        else => return err,
+    }) {}
 }
 
-fn handleRequest(reader: *Io.Reader, writer: *Io.Writer) !bool {
-    // read until entire request head arrives
+fn handleRequest(timeout_reader: *net.TimeoutReader, writer: *Io.Writer) !bool {
+    const reader = &timeout_reader.interface;
+
+    // idle: next request not here yet
+    if (reader.bufferedLen() == 0) {
+        // wait for client, so send response we already have now
+        try writer.flush();
+        timeout_reader.deadlineIn(idle_timeout);
+
+        reader.fillMore() catch |err| switch (err) {
+            error.EndOfStream => return false, // client hung up
+            error.ReadFailed => if (timeout_reader.err.? == error.Timeout) return false else return err, // timeout not error
+        };
+    }
+
+    // head: one deadline for entire head
+    timeout_reader.deadlineIn(head_timeout);
     const head_len = while (true) {
         if (http.Request.findHeadEnd(reader.buffered())) |len| break len;
         if (reader.bufferedLen() == reader.buffer.len) return error.HeadTooLarge;
-        // wait for client, so send response we already have now
         try writer.flush();
-
-        reader.fillMore() catch |err| switch (err) {
-            // hang up between request -> done, not error
-            error.EndOfStream => if (reader.bufferedLen() == 0) return false else return err,
-            else => return err,
-        };
+        try reader.fillMore();
     };
+
     var header_buf: [64]http.Request.Header = undefined;
     const request = try http.Request.parse(reader.buffered()[0..head_len], &header_buf);
     std.log.info("{t} {s} {t}, {d} headers, body: {any}", .{ request.method, request.target, request.version, request.headers.len, request.body });
@@ -91,6 +112,9 @@ fn handleRequest(reader: *Io.Reader, writer: *Io.Writer) !bool {
     const keep_alive = request.keepAlive();
 
     reader.toss(head_len);
+
+    // body: one deadline for reading or skipping body
+    timeout_reader.deadlineIn(body_timeout);
     switch (request.body) {
         .none => {},
         .length => |n| {
