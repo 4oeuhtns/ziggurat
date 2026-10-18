@@ -6,31 +6,19 @@ const ziggurat = @import("ziggurat");
 const http = ziggurat.http;
 const net = ziggurat.net;
 
-const keep_alive_response = response("keep-alive");
-const close_response = response("close");
-
 /// how long a connection may wait for its next request
 const idle_timeout: Io.Duration = .fromSeconds(10);
 /// how long the whole request head may take to arrive
 const head_timeout: Io.Duration = .fromSeconds(5);
 /// how long the whole body may take to arrive
 const body_timeout: Io.Duration = .fromSeconds(10);
+const write_timeout: Io.Duration = .fromSeconds(10);
 
 /// biggest request body we accept
 const max_body = 1024 * 1024;
 
 pub fn main(init: std.process.Init) !void {
     try serve(init.io);
-}
-
-/// builds response, connection is `keep-alive` or `close`
-fn response(comptime connection: []const u8) []const u8 {
-    return "HTTP/1.1 200 OK\r\n" ++
-        "Content-Type: text/plain\r\n" ++
-        "Content-Length: 14\r\n" ++
-        "Connection: " ++ connection ++ "\r\n" ++
-        "\r\n" ++
-        "Hello, World!\n";
 }
 
 /// accepts connections with each as its own task
@@ -69,25 +57,42 @@ fn handleConnection(io: Io, stream: Io.net.Stream) !void {
     var timeout_reader = net.TimeoutReader.init(stream, io, &read_buffer);
 
     var write_buffer: [1024]u8 = undefined;
-    var stream_writer = stream.writer(io, &write_buffer);
-    const writer = &stream_writer.interface;
+    var timeout_writer = net.TimeoutWriter.init(stream, io, &write_buffer);
 
-    defer writer.flush() catch {};
+    var date: http.DateCache = .{};
 
     // not just try, return correct errors from timeout reader
-    while (handleRequest(&timeout_reader, writer) catch |err| switch (err) {
-        error.ReadFailed => return timeout_reader.err.?,
-        else => return err,
+    while (handleRequest(&timeout_reader, &timeout_writer, &date, io) catch |err| {
+        const reason = switch (err) {
+            error.ReadFailed => timeout_reader.err.?,
+            error.WriteFailed => return timeout_writer.err.?,
+            else => err,
+        };
+
+        if (http.Status.fromError(reason)) |s| {
+            timeout_writer.deadlineIn(write_timeout);
+            var res: http.Response = .{
+                .writer = &timeout_writer.interface,
+                .date = date.now(io),
+                .keep_alive = false,
+                .status = s,
+            };
+            try res.send(s.phrase());
+        }
+        try flush(&timeout_writer);
+        return reason;
     }) {}
+
+    try flush(&timeout_writer);
 }
 
-fn handleRequest(timeout_reader: *net.TimeoutReader, writer: *Io.Writer) !bool {
+fn handleRequest(timeout_reader: *net.TimeoutReader, timeout_writer: *net.TimeoutWriter, date: *http.DateCache, io: Io) !bool {
     const reader = &timeout_reader.interface;
 
     // idle: next request not here yet
     if (reader.bufferedLen() == 0) {
         // wait for client, so send response we already have now
-        try writer.flush();
+        try flush(timeout_writer);
         timeout_reader.deadlineIn(idle_timeout);
 
         reader.fillMore() catch |err| switch (err) {
@@ -101,7 +106,7 @@ fn handleRequest(timeout_reader: *net.TimeoutReader, writer: *Io.Writer) !bool {
     const head_len = while (true) {
         if (http.Request.findHeadEnd(reader.buffered())) |len| break len;
         if (reader.bufferedLen() == reader.buffer.len) return error.HeadTooLarge;
-        try writer.flush();
+        try flush(timeout_writer);
         try reader.fillMore();
     };
 
@@ -134,6 +139,18 @@ fn handleRequest(timeout_reader: *net.TimeoutReader, writer: *Io.Writer) !bool {
         },
     }
 
-    try writer.writeAll(if (keep_alive) keep_alive_response else close_response);
+    timeout_writer.deadlineIn(write_timeout);
+    var res: http.Response = .{
+        .writer = &timeout_writer.interface,
+        .date = date.now(io),
+        .keep_alive = keep_alive,
+    };
+    try res.send("Hello, World!\n");
+
     return keep_alive;
+}
+
+fn flush(timeout_writer: *net.TimeoutWriter) !void {
+    timeout_writer.deadlineIn(write_timeout);
+    try timeout_writer.interface.flush();
 }
