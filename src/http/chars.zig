@@ -16,3 +16,13 @@ pub fn isValueChar(c: u8) bool {
         else => false,
     };
 }
+
+/// allowed in a `Host` value: a host name, an IP address, a port (RFC 3986 section 3.2.2)
+/// stricter than the RFC: no comma, since a comma usually means two `Host` headers glued together
+pub fn isHostChar(c: u8) bool {
+    return switch (c) {
+        'a'...'z', 'A'...'Z', '0'...'9' => true,
+        '-', '.', '_', '~', '%', '!', '$', '&', '\'', '(', ')', '*', '+', ';', '=', ':', '[', ']' => true,
+        else => false,
+    };
+}

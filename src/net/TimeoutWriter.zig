@@ -4,19 +4,21 @@ const std = @import("std");
 const Io = std.Io;
 const TimeoutWriter = @This();
 
+/// does the writes and reads the clock
 io: Io,
+/// the socket being written
 stream: Io.net.Stream,
 /// what callers write through
 interface: Io.Writer,
-/// when writes give up
+/// when writes give up, `.none` until `deadlineIn` is called
 timeout: Io.Timeout,
-/// why the last write failed
+/// why the last write failed with `error.WriteFailed`, `null` if none has
 err: ?Error,
 
 /// why a write failed: the wait (Timeout, Canceled, ...) or the send (ConnectionResetByPeer, ...)
 pub const Error = Io.net.Stream.Writer.Error || Io.OperateTimeoutError;
 
-/// a writer with no deadline yet
+/// a writer over `stream` with no deadline yet, `buffer` holds bytes written but not yet sent
 pub fn init(stream: Io.net.Stream, io: Io, buffer: []u8) TimeoutWriter {
     return .{
         .io = io,
@@ -31,11 +33,13 @@ pub fn init(stream: Io.net.Stream, io: Io, buffer: []u8) TimeoutWriter {
 }
 
 /// writes from now on must start within `duration`, counted from this call
+/// the deadline is a fixed moment: writes that get through don't push it back
 pub fn deadlineIn(w: *TimeoutWriter, duration: Io.Duration) void {
     const dur: Io.Clock.Duration = .{ .raw = duration, .clock = .awake };
     w.timeout = .{ .deadline = Io.Clock.Timestamp.fromNow(w.io, dur) };
 }
 
+/// waits until the socket has room (unless there's no deadline), then sends the buffer and `data` in one `sendmsg`
 fn drainImpl(io_w: *Io.Writer, data: []const []const u8, splat: usize) Io.Writer.Error!usize {
     // 1. find the TimeoutWriter around `io_w`
     // 2. unless the timeout is `.none`: wait for room with an empty `file_write_streaming`

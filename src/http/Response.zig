@@ -1,9 +1,12 @@
+//! one HTTP response, written to a writer
+
 const std = @import("std");
 const Io = std.Io;
 const DateCache = @import("DateCache.zig");
 const Header = @import("Request.zig").Header;
 const Response = @This();
 
+/// the statuses this server sends. Each value is its number
 pub const Status = enum(u16) {
     ok = 200,
     bad_request = 400,
@@ -17,6 +20,7 @@ pub const Status = enum(u16) {
     service_unavailable = 503,
     http_version_not_supported = 505,
 
+    /// the words after the number, like `Not Found`
     pub fn phrase(status: Status) []const u8 {
         return switch (status) {
             .ok => "OK",
@@ -33,35 +37,51 @@ pub const Status = enum(u16) {
         };
     }
 
+    /// the whole status line, like `HTTP/1.1 200 OK\r\n`, built at compile time
     pub fn line(status: Status) []const u8 {
         return switch (status) {
             inline else => |s| comptime std.fmt.comptimePrint("HTTP/1.1 {d} {s}\r\n", .{ @intFromEnum(s), s.phrase() }), // HTTP/1.1 version server uses
         };
     }
 
+    /// the status that answers a request which failed with `err`, or `null` when nobody is listening
     pub fn fromError(err: anyerror) ?Status {
         return switch (err) {
-            error.BadRequestLine, error.BadHeader, error.IncompleteHead, error.BadContentLength, error.AmbiguousFraming, error.BadChunkSize, error.BadChunkExtension, error.BadLineEnding, error.BadTrailer => .bad_request,
+            error.BadRequestLine, error.BadHeader, error.IncompleteHead, error.BadContentLength, error.AmbiguousFraming, error.BadChunkSize, error.BadChunkExtension, error.BadLineEnding, error.BadTrailer, error.IncompleteBody, error.BadHost => .bad_request,
             error.Timeout => .request_timeout,
             error.BodyTooLarge => .content_too_large,
             error.HeadTooLarge, error.TooManyHeaders => .request_header_fields_too_large,
             error.UnknownMethod, error.UnsupportedTransferEncoding => .not_implemented,
             error.UnsupportedVersion => .http_version_not_supported,
+            error.HandlerFailed => .internal_server_error,
             else => null,
         };
     }
 };
 
+/// where the response goes
 writer: *Io.Writer,
+/// text for the `Date` header
 date: *const [DateCache.len]u8,
+/// whether the connection stays open afterwards
 keep_alive: bool = true,
+/// which status line to send
 status: Status = .ok,
+/// the `Content-Type` header
 content_type: []const u8 = "text/plain",
+/// extra headers, written as given after `Connection`
 headers: []const Header = &.{},
+/// for answers to `HEAD`: the head as usual, with the body's real `Content-Length`, but no body
+omit_body: bool = false,
+/// whether `send` has run. The server uses it to notice a handler that didn't answer
+sent: bool = false,
 
+/// writes one complete response: status line, headers, blank line, body. Doesn't flush
+/// the blank line and body go in one vectored write, so a big body leaves with the head and isn't copied
 pub fn send(res: *Response, body: []const u8) Io.Writer.Error!void {
+    std.debug.assert(!res.sent); // one response per request
     const w = res.writer;
-    try w.print("{s}", .{res.status.line()});
+    try w.writeAll(res.status.line());
     try w.print("Date: {s}\r\n", .{res.date.*});
     try w.print("Content-Type: {s}\r\n", .{res.content_type});
     try w.print("Content-Length: {d}\r\n", .{body.len});
@@ -69,8 +89,9 @@ pub fn send(res: *Response, body: []const u8) Io.Writer.Error!void {
     for (res.headers) |h| {
         try w.print("{s}: {s}\r\n", .{ h.name, h.value });
     }
-    var tail = [_][]const u8{ "\r\n", body };
+    var tail = [_][]const u8{ "\r\n", if (res.omit_body) "" else body };
     try w.writeVecAll(&tail);
+    res.sent = true;
 }
 
 // Tests
@@ -110,6 +131,9 @@ test "Status.fromError" {
         .{ error.ConnectionResetByPeer, null },
         .{ error.WriteFailed, null },
         .{ error.Canceled, null },
+        .{ error.IncompleteBody, .bad_request },
+        .{ error.BadHost, .bad_request },
+        .{ error.HandlerFailed, .internal_server_error },
     };
     for (cases) |case| {
         const err, const expected = case;
@@ -172,6 +196,25 @@ test "an empty body still has a length" {
     try std.testing.expect(std.mem.endsWith(u8, writer.buffered(), "\r\n\r\n"));
 }
 
+test "an answer to HEAD has the length but not the body" {
+    var buf: [256]u8 = undefined;
+    var writer: Io.Writer = .fixed(&buf);
+    var res: Response = .{ .writer = &writer, .date = test_date, .omit_body = true };
+    try res.send("Hello, World!\n");
+
+    try std.testing.expect(std.mem.find(u8, writer.buffered(), "\r\nContent-Length: 14\r\n") != null);
+    try std.testing.expect(std.mem.endsWith(u8, writer.buffered(), "\r\n\r\n"));
+}
+
+test "send remembers that it ran" {
+    var buf: [256]u8 = undefined;
+    var writer: Io.Writer = .fixed(&buf);
+    var res: Response = .{ .writer = &writer, .date = test_date };
+    try std.testing.expect(!res.sent);
+    try res.send("");
+    try std.testing.expect(res.sent);
+}
+
 /// a writer that remembers how it was drained, standing in for a socket
 const Recorder = struct {
     interface: Io.Writer,
@@ -225,6 +268,7 @@ test "small responses wait in the buffer" {
 
     var res: Response = .{ .writer = &recorder.interface, .date = test_date };
     try res.send("one");
+    res.sent = false; // pretend the next request came in
     try res.send("two");
     try std.testing.expectEqual(0, recorder.drains); // nothing sent yet: pipelined answers can leave together
 

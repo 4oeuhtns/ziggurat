@@ -11,6 +11,8 @@ target: []const u8,
 version: Version,
 headers: []const Header,
 body: Body,
+/// the body, read like any other reader. `parse` leaves it empty, the server points it at the body
+reader: *std.Io.Reader = std.Io.Reader.ending,
 
 pub const Method = enum { GET, HEAD, POST, PUT, DELETE, CONNECT, OPTIONS, TRACE, PATCH };
 pub const Version = enum { @"HTTP/1.0", @"HTTP/1.1" };
@@ -124,6 +126,37 @@ pub fn header(request: Request, name: []const u8) ?[]const u8 {
     return null;
 }
 
+/// the target up to the first `?`
+pub fn path(request: Request) []const u8 {
+    const first, _ = std.mem.cutScalar(u8, request.target, '?') orelse return request.target;
+    return first;
+}
+
+/// what follows the first `?`, or `null` when there is no `?`
+pub fn query(request: Request) ?[]const u8 {
+    _, const last = std.mem.cutScalar(u8, request.target, '?') orelse return null;
+    return last;
+}
+
+/// the `Host` header's value, after checking the rule (RFC 9112 section 3.2)
+/// more than one is `BadHost`, and so is none in HTTP/1.1. HTTP/1.0 with none is `null`
+pub fn host(request: Request) error{BadHost}!?[]const u8 {
+    var found: ?[]const u8 = null;
+    for (request.headers) |h| {
+        if (!std.ascii.eqlIgnoreCase(h.name, "host")) continue;
+        if (found != null) return error.BadHost; // found more than once
+        if (!isHost(h.value)) return error.BadHost; // doesn't use host characters
+        found = h.value;
+    }
+    if (found == null) {
+        return switch (request.version) {
+            .@"HTTP/1.0" => null,
+            .@"HTTP/1.1" => error.BadHost,
+        };
+    }
+    return found;
+}
+
 /// whether the client wants the connection to be kept open (RFC 9112 section 9.3)
 /// HTTP/1.1 stays open unless told `close`, HTTP/1.0 closes unless told `keep-alive`
 pub fn keepAlive(request: Request) bool {
@@ -178,6 +211,14 @@ fn isToken(text: []const u8) bool {
     if (text.len == 0) return false;
     for (text) |c| {
         if (!chars.isTokenChar(c)) return false;
+    }
+    return true;
+}
+
+// a host, an IP address or a port, made only of these characters. Empty is allowed
+fn isHost(text: []const u8) bool {
+    for (text) |c| {
+        if (!chars.isHostChar(c)) return false;
     }
     return true;
 }
@@ -414,4 +455,59 @@ test "two pipelined requests in one buffer" {
     const second = try parse(rest[0..findHeadEnd(rest).?], &second_headers);
     try std.testing.expectEqual(.GET, second.method);
     try std.testing.expectEqualStrings("/b", second.target);
+}
+
+test "path and query" {
+    const cases = [_]struct { []const u8, []const u8, ?[]const u8 }{
+        .{ "/", "/", null },
+        .{ "/a/b", "/a/b", null },
+        .{ "/search?q=zig", "/search", "q=zig" },
+        .{ "/search?", "/search", "" },
+        .{ "/a?b?c", "/a", "b?c" }, // only the first `?` splits
+        .{ "*", "*", null },
+    };
+    for (cases) |case| {
+        const target, const expected_path, const expected_query = case;
+        const request: Request = .{ .method = .GET, .target = target, .version = .@"HTTP/1.1", .headers = &.{}, .body = .none };
+        try std.testing.expectEqualStrings(expected_path, request.path());
+        if (expected_query) |q| {
+            try std.testing.expectEqualStrings(q, request.query().?);
+        } else {
+            try std.testing.expectEqual(null, request.query());
+        }
+    }
+}
+
+test host {
+    const cases = [_]struct { []const u8, error{BadHost}!?[]const u8 }{
+        .{ "GET / HTTP/1.1\r\nHost: example.com\r\n\r\n", "example.com" },
+        .{ "GET / HTTP/1.1\r\nhost: localhost:3000\r\n\r\n", "localhost:3000" },
+        .{ "GET / HTTP/1.1\r\nHost: [::1]:3000\r\n\r\n", "[::1]:3000" },
+        .{ "GET / HTTP/1.1\r\nHost:\r\n\r\n", "" }, // empty is allowed
+        .{ "GET / HTTP/1.0\r\n\r\n", null }, // HTTP/1.0 didn't have Host yet
+        .{ "GET / HTTP/1.0\r\nHost: example.com\r\n\r\n", "example.com" },
+        .{ "GET / HTTP/1.1\r\n\r\n", error.BadHost }, // missing
+        .{ "GET / HTTP/1.1\r\nHost: a\r\nHost: a\r\n\r\n", error.BadHost }, // two, even when they agree
+        .{ "GET / HTTP/1.0\r\nHost: a\r\nHost: b\r\n\r\n", error.BadHost },
+        .{ "GET / HTTP/1.1\r\nHost: a b\r\n\r\n", error.BadHost }, // space
+        .{ "GET / HTTP/1.1\r\nHost: a/b\r\n\r\n", error.BadHost }, // a path isn't a host
+        .{ "GET / HTTP/1.1\r\nHost: user@a\r\n\r\n", error.BadHost }, // no user names
+        .{ "GET / HTTP/1.1\r\nHost: a, b\r\n\r\n", error.BadHost },
+    };
+    for (cases) |case| {
+        const input, const expected = case;
+        errdefer std.debug.print("failed on: \"{f}\"\n", .{std.zig.fmtString(input)});
+        var header_buf: [8]Header = undefined;
+        const request = try parse(input, &header_buf);
+        if (expected) |value| {
+            const actual = try request.host();
+            if (value) |text| {
+                try std.testing.expectEqualStrings(text, actual.?);
+            } else {
+                try std.testing.expectEqual(null, actual);
+            }
+        } else |err| {
+            try std.testing.expectError(err, request.host());
+        }
+    }
 }

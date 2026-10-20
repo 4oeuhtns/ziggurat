@@ -1,9 +1,13 @@
+//! the HTTP `Date` header text, formatted once per second
+
 const std = @import("std");
 const Io = std.Io;
 const DateCache = @This();
 
-pub const len = 29; // length of http date response
-pub const weekdays: [7][3]u8 = .{
+/// length of every HTTP date, like `Sun, 06 Nov 1994 08:49:37 GMT`
+pub const len = 29;
+/// day names, Thursday first: 1 January 1970 (day 0) was a Thursday
+const weekdays: [7][3]u8 = .{
     "Thu".*,
     "Fri".*,
     "Sat".*,
@@ -12,7 +16,8 @@ pub const weekdays: [7][3]u8 = .{
     "Tue".*,
     "Wed".*,
 };
-pub const months: [12][3]u8 = .{
+/// month names, January first
+const months: [12][3]u8 = .{
     "Jan".*,
     "Feb".*,
     "Mar".*,
@@ -27,9 +32,12 @@ pub const months: [12][3]u8 = .{
     "Dec".*,
 };
 
+/// which second `text` is for. Starts at a second no real clock gives
 second: i64 = -1,
+/// the cached date text
 text: [len]u8 = undefined,
 
+/// the HTTP date for `seconds` since 1 January 1970. No state, no clock
 pub fn format(seconds: u64) [len]u8 {
     // ex. Tue, 13 Oct 2026 21:32:16 GMT
     const epoch: std.time.epoch.EpochSeconds = .{ .secs = seconds };
@@ -53,6 +61,7 @@ pub fn format(seconds: u64) [len]u8 {
     return buf;
 }
 
+/// the date text for `seconds`, formatting only when the second changed
 pub fn get(cache: *DateCache, seconds: i64) *const [len]u8 {
     if (cache.second == seconds) {
         return &cache.text;
@@ -62,6 +71,7 @@ pub fn get(cache: *DateCache, seconds: i64) *const [len]u8 {
     return &cache.text;
 }
 
+/// the date text for right now, from the `.real` clock
 pub fn now(cache: *DateCache, io: Io) *const [len]u8 {
     const s = Io.Clock.real.now(io).toSeconds();
     return get(cache, s);
