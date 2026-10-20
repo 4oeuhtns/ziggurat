@@ -47,7 +47,6 @@ pub fn Router(comptime routes: anytype) type {
 
 /// stops the build with a message naming the route, when the route list has a mistake
 fn check(comptime routes: anytype) void {
-    // TODO: for every route: the path starts with `/`, has no `?`, and no earlier route has the same method and path
     for (routes, 0..) |route, i| {
         const method: Request.Method, const pattern: []const u8, _ = route;
         const name = @tagName(method) ++ " " ++ pattern; // "GET /home"
