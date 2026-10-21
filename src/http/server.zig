@@ -148,10 +148,10 @@ pub fn Server(comptime R: type) type {
                 _ = server.io.swapCancelProtection(prot);
                 fill catch |err| switch (err) {
                     error.EndOfStream => return false, // client hung up
-                    error.ReadFailed => {
-                        if (reader.err.? == error.Timeout or reader.err.? == error.Canceled) {
-                            return false; //  idle timeout or shutdown, end quietly
-                        } else return err;
+                    error.ReadFailed => switch (reader.err.?) {
+                        // idle timeout, shutdown, or the client hung up abruptly: end quietly
+                        error.Timeout, error.Canceled, error.ConnectionResetByPeer => return false,
+                        else => return err,
                     },
                 };
             }
