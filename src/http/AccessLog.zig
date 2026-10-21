@@ -87,7 +87,7 @@ pub const Stdout = struct {
         s.task = try io.concurrent(run, .{ &s.log, io, &s.out.interface });
     }
 
-    /// closes the log, then write what's left
+    /// closes the log, then writes what's left
     pub fn stop(s: *Stdout, io: Io) void {
         s.log.close(io);
         s.task.await(io) catch {};

@@ -150,7 +150,7 @@ pub fn Server(comptime R: type) type {
                     error.EndOfStream => return false, // client hung up
                     error.ReadFailed => {
                         if (reader.err.? == error.Timeout or reader.err.? == error.Canceled) {
-                            return false; // timeout -> Canceled, quietly shuts down
+                            return false; //  idle timeout or shutdown, end quietly
                         } else return err;
                     },
                 };
@@ -228,7 +228,7 @@ pub fn Server(comptime R: type) type {
 }
 
 /// runs a server until `waitForStop` returns, then lets requests in progress finish
-pub fn serve(io: Io, comptime R: type, options: Options, waitForStop: *const fn (Io) Io.Cancelable!void) !void {
+pub fn serve(io: Io, comptime R: type, options: Options, comptime waitForStop: fn (Io) Io.Cancelable!void) !void {
     var server: Server(R) = try .init(io, options);
     defer server.deinit();
     var running = try io.concurrent(Server(R).run, .{&server});
