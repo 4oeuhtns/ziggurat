@@ -9,7 +9,16 @@ const Router = z.http.Router(.{
 });
 
 pub fn main(init: std.process.Init) !void {
-    try z.http.serve(init.io, Router, .{ .port = 3000 });
+    const io = init.io;
+    z.signals.install();
+
+    var storage: [4096]z.http.AccessLog.Entry = undefined;
+    var out_buffer: [16 * 1024]u8 = undefined;
+    var access_log: z.http.AccessLog.Stdout = undefined;
+    try access_log.start(io, &storage, &out_buffer);
+    defer access_log.stop(io);
+
+    try z.http.serve(io, Router, .{ .port = 3000, .access_log = &access_log.log }, z.signals.wait);
 }
 
 /// answers "Hello, World!"

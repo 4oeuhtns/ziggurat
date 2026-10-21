@@ -8,6 +8,7 @@ const Response = @import("Response.zig");
 const Status = Response.Status;
 const DateCache = @import("DateCache.zig");
 const BodyReader = @import("BodyReader.zig");
+const AccessLog = @import("AccessLog.zig");
 
 pub const Options = struct {
     host: []const u8 = "127.0.0.1",
@@ -18,6 +19,8 @@ pub const Options = struct {
     body_timeout: Io.Duration = .fromSeconds(10),
     write_timeout: Io.Duration = .fromSeconds(10),
     max_body: u64 = 1024 * 1024,
+    max_connections: u32 = 1024,
+    access_log: ?*AccessLog = null,
 };
 
 /// biggest request head
@@ -32,6 +35,7 @@ pub fn Server(comptime R: type) type {
         listener: Io.net.Server,
         /// one task per connection
         group: Io.Group,
+        slots: Slots,
 
         const Self = @This();
 
@@ -43,6 +47,7 @@ pub fn Server(comptime R: type) type {
                 .options = options,
                 .listener = try listen_address.listen(io, .{ .reuse_address = true }),
                 .group = .init,
+                .slots = .init(options.max_connections),
             };
         }
 
@@ -60,14 +65,21 @@ pub fn Server(comptime R: type) type {
         /// accepts connections until canceled, then returns `error.Canceled`
         pub fn run(server: *Self) Io.Cancelable!void {
             while (true) {
-                const stream = server.listener.accept(server.io) catch |err| switch (err) {
-                    error.Canceled => return error.Canceled,
-                    else => {
-                        std.log.warn("accept failed: {t}", .{err});
-                        continue;
-                    },
+                try server.slots.take(server.io);
+                const stream = server.listener.accept(server.io) catch |err| {
+                    server.slots.give(server.io);
+                    switch (err) {
+                        error.Canceled => return error.Canceled,
+                        error.ConnectionAborted => continue,
+                        else => {
+                            std.log.warn("accept failed: {t}", .{err});
+                            try server.io.sleep(.fromMilliseconds(100), .awake);
+                            continue;
+                        },
+                    }
                 };
                 server.group.concurrent(server.io, serveConnection, .{ server, stream }) catch |err| {
+                    server.slots.give(server.io);
                     std.log.warn("can't start connection task: {t}", .{err});
                     stream.close(server.io);
                 };
@@ -76,6 +88,8 @@ pub fn Server(comptime R: type) type {
 
         /// one connection, as its own task. Tasks can't return errors, so it logs them (but not `error.Canceled`)
         fn serveConnection(server: *Self, stream: Io.net.Stream) void {
+            _ = server.io.swapCancelProtection(.blocked);
+            defer server.slots.give(server.io);
             handleConnection(server, stream) catch |err| switch (err) {
                 error.Canceled => {},
                 else => std.log.warn("connection failed: {t}", .{err}),
@@ -129,13 +143,21 @@ pub fn Server(comptime R: type) type {
                 try server.flush(writer);
                 reader.deadlineIn(server.options.idle_timeout);
 
-                r.fillMore() catch |err| switch (err) {
+                const prot = server.io.swapCancelProtection(.unblocked);
+                const fill = r.fillMore();
+                _ = server.io.swapCancelProtection(prot);
+                fill catch |err| switch (err) {
                     error.EndOfStream => return false, // client hung up
-                    error.ReadFailed => if (reader.err.? == error.Timeout) return false else return err, // timeout not error
+                    error.ReadFailed => {
+                        if (reader.err.? == error.Timeout or reader.err.? == error.Canceled) {
+                            return false; // timeout -> Canceled, quietly shuts down
+                        } else return err;
+                    },
                 };
             }
 
             // head: one deadline for entire head
+            const started = Io.Clock.awake.now(server.io);
             reader.deadlineIn(server.options.head_timeout);
             const head_len = while (true) {
                 if (Request.findHeadEnd(r.buffered())) |len| break len;
@@ -147,7 +169,6 @@ pub fn Server(comptime R: type) type {
 
             var header_buf: [max_headers]Request.Header = undefined;
             var request = try Request.parse(r.buffered()[0..head_len], &header_buf);
-            std.log.info("{t} {s} {t}, {d} headers, body: {any}", .{ request.method, request.target, request.version, request.headers.len, request.body });
 
             const keep_alive = request.keepAlive();
 
@@ -165,16 +186,16 @@ pub fn Server(comptime R: type) type {
             reader.deadlineIn(server.options.body_timeout);
 
             writer.deadlineIn(server.options.write_timeout);
-            var res: Response = .{
+            var response: Response = .{
                 .writer = &writer.interface,
                 .date = date.now(server.io),
                 .keep_alive = keep_alive,
                 .omit_body = request.method == .HEAD, // omits body if it is a HEAD request
             };
 
-            R.handle(&request, &res) catch |err| {
+            R.handle(&request, &response) catch |err| {
                 if (err == error.WriteFailed) return error.WriteFailed;
-                if (res.sent) { // close connection, don't send again
+                if (response.sent) { // close connection, don't send again
                     std.log.warn("{t} {s}: handler failed after answering: {t}", .{ request.method, request.target, err });
                     return false;
                 }
@@ -182,9 +203,14 @@ pub fn Server(comptime R: type) type {
                 std.log.warn("{t} {s}: handler failed: {t}", .{ request.method, request.target, err });
                 return error.HandlerFailed;
             };
-            if (!res.sent) {
+            if (!response.sent) {
                 std.log.warn("{t} {s}: handler sent no answer", .{ request.method, request.target });
                 return error.HandlerFailed;
+            }
+
+            if (server.options.access_log) |log| {
+                const micros = started.untilNow(server.io, .awake).toMicroseconds();
+                log.record(server.io, .init(request.method, request.target, @intFromEnum(response.status), @intCast(micros)));
             }
 
             _ = body_reader.interface.discardRemaining() catch return false; // clear rest of body from reader before next request
@@ -201,12 +227,16 @@ pub fn Server(comptime R: type) type {
     };
 }
 
-/// `init`, log the address, `run`, with `deinit` deferred
-pub fn serve(io: Io, comptime R: type, options: Options) !void {
+/// runs a server until `waitForStop` returns, then lets requests in progress finish
+pub fn serve(io: Io, comptime R: type, options: Options, waitForStop: *const fn (Io) Io.Cancelable!void) !void {
     var server: Server(R) = try .init(io, options);
     defer server.deinit();
+    var running = try io.concurrent(Server(R).run, .{&server});
+    defer running.cancel(io) catch {};
     std.log.info("listening on http://{f}/", .{server.address()});
-    try server.run();
+
+    try waitForStop(io);
+    std.log.info("shutting down", .{});
 }
 
 /// hides the first `n` buffered bytes from `r`
@@ -224,6 +254,28 @@ fn giveBack(r: *Io.Reader, whole: []u8) void {
     r.seek = 0;
     r.end = unread.len;
 }
+
+/// counts free connection slots. Only `run` takes slots. Any connection task gives one back
+const Slots = struct {
+    free: std.atomic.Value(u32),
+
+    fn init(n: u32) Slots {
+        return .{ .free = .init(n) };
+    }
+
+    /// sleeps while no slot is free, then takes one.
+    /// only run takes slot, everything else gives back, can only go up between check and subtraction.
+    fn take(slots: *Slots, io: Io) Io.Cancelable!void {
+        while (slots.free.load(.acquire) == 0) try io.futexWait(u32, &slots.free.raw, 0);
+        _ = slots.free.fetchSub(1, .release); // subtract one when not 0 anymore
+    }
+
+    /// puts a slot back, and wakes `run` in case it's waiting for one
+    fn give(slots: *Slots, io: Io) void {
+        _ = slots.free.fetchAdd(1, .release);
+        io.futexWake(u32, &slots.free.raw, 1);
+    }
+};
 
 // Tests
 const Router = @import("router.zig").Router;
@@ -256,6 +308,12 @@ fn fail(_: *const Request, _: *Response) !void {
 
 fn silent(_: *const Request, _: *Response) !void {}
 
+/// takes a while, like a handler waiting for a database
+fn slow(_: *const Request, res: *Response) !void {
+    try std.testing.io.sleep(.fromMilliseconds(200), .awake);
+    try res.send("slow but done");
+}
+
 const TestServer = Server(Router(.{
     .{ .GET, "/", hello },
     .{ .POST, "/echo", echo },
@@ -263,6 +321,7 @@ const TestServer = Server(Router(.{
     .{ .POST, "/ignore", ignore },
     .{ .GET, "/fail", fail },
     .{ .GET, "/silent", silent },
+    .{ .GET, "/slow", slow },
 }));
 
 /// connects to `address`, sends `request`, and returns everything the server says before it hangs up
@@ -458,4 +517,103 @@ test "a client that stalls mid-head gets 408, an idle one is dropped quietly" {
         try std.testing.expect(std.mem.startsWith(u8, reply.buffered(), expected_start));
         if (expected_start.len == 0) try std.testing.expectEqualStrings("", reply.buffered());
     }
+}
+
+test "at the connection limit, new clients wait their turn" {
+    std.testing.log_level = .err;
+    const io = std.testing.io;
+    var server: TestServer = try .init(io, .{ .port = 0, .max_connections = 1 });
+    defer server.deinit();
+    var running = try io.concurrent(TestServer.run, .{&server});
+    defer running.cancel(io) catch {};
+
+    // the first client takes the only slot and just sits there
+    const first = try server.address().connect(io, .{ .mode = .stream });
+    var first_open = true;
+    defer if (first_open) first.close(io);
+
+    // the second gets connected by the system, but the server isn't serving it yet
+    const second = try server.address().connect(io, .{ .mode = .stream });
+    defer second.close(io);
+    var writer = second.writer(io, &.{});
+    try writer.interface.writeAll("GET / HTTP/1.1\r\nHost: test\r\n\r\n");
+
+    var buf: [64]u8 = undefined;
+    var reader: net.TimeoutReader = .init(second, io, &buf);
+    reader.deadlineIn(.fromMilliseconds(150));
+    try std.testing.expectError(error.ReadFailed, reader.interface.peekByte());
+    try std.testing.expect(reader.err.? == error.Timeout);
+
+    // the first one leaves, and now it's the second one's turn
+    first.close(io);
+    first_open = false;
+    reader.deadlineIn(.fromSeconds(5));
+    try std.testing.expectEqualStrings("HTTP/1.1 200 OK", try reader.interface.take(15));
+}
+
+test "shutting down lets a request in progress finish, and drops idle connections" {
+    std.testing.log_level = .err;
+    const io = std.testing.io;
+    var server: TestServer = try .init(io, .{ .port = 0 });
+    var running = try io.concurrent(TestServer.run, .{&server});
+
+    const idle = try server.address().connect(io, .{ .mode = .stream });
+    defer idle.close(io);
+    const busy = try server.address().connect(io, .{ .mode = .stream });
+    defer busy.close(io);
+    var writer = busy.writer(io, &.{});
+    try writer.interface.writeAll("GET /slow HTTP/1.1\r\nHost: test\r\n\r\n");
+    try io.sleep(.fromMilliseconds(50), .awake); // long enough for the handler to have started
+
+    // shut down while the handler is still working
+    const start = Io.Clock.awake.now(io);
+    running.cancel(io) catch {};
+    server.deinit();
+    const took = start.untilNow(io, .awake).toMilliseconds();
+    try std.testing.expect(took >= 100); // it waited for the slow handler
+    try std.testing.expect(took < 2000); // but not for the idle connection's timeout
+
+    var buf: [1024]u8 = undefined;
+    var busy_reader: net.TimeoutReader = .init(busy, io, &.{});
+    busy_reader.deadlineIn(.fromSeconds(5));
+    var busy_reply: Io.Writer = .fixed(&buf);
+    _ = try busy_reader.interface.streamRemaining(&busy_reply);
+    var rest: []const u8 = busy_reply.buffered();
+    try std.testing.expectEqualStrings("slow but done", (try nextReply(&rest)).body);
+
+    var idle_reader: net.TimeoutReader = .init(idle, io, &.{});
+    idle_reader.deadlineIn(.fromSeconds(5));
+    var idle_buf: [64]u8 = undefined;
+    var idle_reply: Io.Writer = .fixed(&idle_buf);
+    _ = try idle_reader.interface.streamRemaining(&idle_reply);
+    try std.testing.expectEqualStrings("", idle_reply.buffered());
+}
+
+test "requests are noted in the access log" {
+    std.testing.log_level = .err;
+    const io = std.testing.io;
+    var storage: [8]AccessLog.Entry = undefined;
+    var access_log: AccessLog = .init(&storage);
+
+    {
+        var server: TestServer = try .init(io, .{ .port = 0, .access_log = &access_log });
+        defer server.deinit();
+        var running = try io.concurrent(TestServer.run, .{&server});
+        defer running.cancel(io) catch {};
+
+        var buf: [1024]u8 = undefined;
+        _ = try exchange(io, server.address(), "GET / HTTP/1.1\r\nHost: test\r\n\r\n" ++
+            "GET /nope?x=1 HTTP/1.1\r\nHost: test\r\n\r\n" ++
+            "POST /echo HTTP/1.1\r\nHost: test\r\nContent-Length: 2\r\n\r\nhi", &buf);
+    }
+    access_log.close(io);
+
+    var out_buf: [512]u8 = undefined;
+    var out: Io.Writer = .fixed(&out_buf);
+    try access_log.run(io, &out);
+    var lines = std.mem.tokenizeScalar(u8, out.buffered(), '\n');
+    try std.testing.expect(std.mem.startsWith(u8, lines.next().?, "GET / 200 "));
+    try std.testing.expect(std.mem.startsWith(u8, lines.next().?, "GET /nope?x=1 404 "));
+    try std.testing.expect(std.mem.startsWith(u8, lines.next().?, "POST /echo 200 "));
+    try std.testing.expectEqual(null, lines.next());
 }
