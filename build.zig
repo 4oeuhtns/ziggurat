@@ -78,6 +78,7 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(hello_exe);
     const run_hello = b.addRunArtifact(hello_exe);
+    if (b.args) |args| run_hello.addArgs(args);
     const hello_step = b.step("hello", "Run the hello example server");
     hello_step.dependOn(&run_hello.step);
 }

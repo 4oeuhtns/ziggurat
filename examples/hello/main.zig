@@ -11,6 +11,12 @@ const Router = z.http.Router(.{
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
     z.signals.install();
+    var quiet = false;
+    var args = init.minimal.args.iterate();
+    _ = args.skip();
+    while (args.next()) |arg| {
+        if (std.mem.eql(u8, arg, "--quiet")) quiet = true;
+    }
 
     var storage: [4096]z.http.AccessLog.Entry = undefined;
     var out_buffer: [16 * 1024]u8 = undefined;
@@ -18,7 +24,7 @@ pub fn main(init: std.process.Init) !void {
     try access_log.start(io, &storage, &out_buffer);
     defer access_log.stop(io);
 
-    try z.http.serve(io, Router, .{ .port = 3000, .access_log = &access_log.log }, z.signals.wait);
+    try z.http.serve(io, Router, .{ .port = 3000, .access_log = if (quiet) null else &access_log.log }, z.signals.wait);
 }
 
 /// answers "Hello, World!"
