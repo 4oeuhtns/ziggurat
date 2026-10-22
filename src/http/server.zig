@@ -156,12 +156,18 @@ pub fn Server(comptime R: type) type {
                 };
             }
 
-            // head: one deadline for entire head
-            const started = Io.Clock.awake.now(server.io);
-            reader.deadlineIn(server.options.head_timeout);
+            // the clock is read only when something needs the time
+            const started: ?Io.Timestamp = if (server.options.access_log != null) Io.Clock.awake.now(server.io) else null;
+
+            // head: one deadline for entire head, set only if the head isn't all here yet
+            var head_deadline_set = false;
             const head_len = while (true) {
                 if (Request.findHeadEnd(r.buffered())) |len| break len;
                 if (r.bufferedLen() >= max_head) return error.HeadTooLarge;
+                if (!head_deadline_set) {
+                    reader.deadlineIn(server.options.head_timeout);
+                    head_deadline_set = true;
+                }
                 try server.flush(writer);
                 try r.fillMore();
             };
@@ -182,8 +188,8 @@ pub fn Server(comptime R: type) type {
             // body only used by handlers, server itself doesn't need info in body
             request.reader = &body_reader.interface;
 
-            // body: one deadline for reading or skipping body
-            reader.deadlineIn(server.options.body_timeout);
+            // body: one deadline for reading or skipping body. No body: nothing reads, so no deadline
+            if (request.body != .none) reader.deadlineIn(server.options.body_timeout);
 
             writer.deadlineIn(server.options.write_timeout);
             var response: Response = .{
@@ -209,7 +215,7 @@ pub fn Server(comptime R: type) type {
             }
 
             if (server.options.access_log) |log| {
-                const micros = started.untilNow(server.io, .awake).toMicroseconds();
+                const micros = started.?.untilNow(server.io, .awake).toMicroseconds();
                 log.record(server.io, .init(request.method, request.target, @intFromEnum(response.status), @intCast(micros)));
             }
 

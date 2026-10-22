@@ -1,7 +1,9 @@
 //! writes to a socket, giving up at a deadline
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Io = std.Io;
+const posix = std.posix;
 const TimeoutWriter = @This();
 
 /// does the writes and reads the clock
@@ -10,7 +12,9 @@ io: Io,
 stream: Io.net.Stream,
 /// what callers write through
 interface: Io.Writer,
-/// when writes give up, `.none` until `deadlineIn` is called
+/// how long writes may wait for room, counted from the first wait. `null`: no limit
+wait_limit: ?Io.Duration,
+/// when writes give up, `.none` until a write first has to wait
 timeout: Io.Timeout,
 /// why the last write failed with `error.WriteFailed`, `null` if none has
 err: ?Error,
@@ -27,29 +31,36 @@ pub fn init(stream: Io.net.Stream, io: Io, buffer: []u8) TimeoutWriter {
             .vtable = &.{ .drain = drainImpl },
             .buffer = buffer,
         },
+        .wait_limit = null,
         .timeout = .none,
         .err = null,
     };
 }
 
-/// writes from now on must start within `duration`, counted from this call
-/// the deadline is a fixed moment: writes that get through don't push it back
+/// from now on, writes that have to wait for room give up `duration` after the first wait
+/// the deadline is a fixed moment: later waits don't push it back. Writes that don't wait never read the clock
 pub fn deadlineIn(w: *TimeoutWriter, duration: Io.Duration) void {
-    const dur: Io.Clock.Duration = .{ .raw = duration, .clock = .awake };
-    w.timeout = .{ .deadline = Io.Clock.Timestamp.fromNow(w.io, dur) };
+    w.wait_limit = duration;
+    w.timeout = .none; // the deadline is set by the first wait
 }
 
-/// waits until the socket has room (unless there's no deadline), then sends the buffer and `data` in one `sendmsg`
+/// sends the buffer and `data` in one `sendmsg`, waiting for room first if the socket is full
 fn drainImpl(io_w: *Io.Writer, data: []const []const u8, splat: usize) Io.Writer.Error!usize {
     // 1. find the TimeoutWriter around `io_w`
-    // 2. unless the timeout is `.none`: wait for room with an empty `file_write_streaming`
-    // 3. send with `netWrite`, exactly as `Io.net.Stream.Writer.drain` does
+    // 2. try to send without waiting: usually the socket has room, so that's the whole job
+    // 3. no room: start the deadline if it hasn't started, and wait for room with an empty `file_write_streaming`
+    // 4. send with `netWrite`, exactly as `Io.net.Stream.Writer.drain` does
     const w: *TimeoutWriter = @alignCast(@fieldParentPtr("interface", io_w));
     const io = w.io;
     const buffered = io_w.buffered();
     const handle = w.stream.socket.handle;
 
-    if (w.timeout != .none) {
+    if (sendNow(handle, buffered, data, splat)) |n| return io_w.consume(n);
+
+    if (w.wait_limit) |limit| {
+        if (w.timeout == .none) {
+            w.timeout = .{ .deadline = .fromNow(io, .{ .raw = limit, .clock = .awake }) };
+        }
         _ = io.operateTimeout(.{
             .file_write_streaming = .{
                 .file = .{ .handle = handle, .flags = .{ .nonblocking = false } },
@@ -66,6 +77,46 @@ fn drainImpl(io_w: *Io.Writer, data: []const []const u8, splat: usize) Io.Writer
         return error.WriteFailed;
     };
     return io_w.consume(n);
+}
+
+/// sends what fits right now without waiting, and returns how many bytes went
+/// `null` when nothing went, for any reason (full, interrupted, a real error): the caller then waits and sends normally,
+/// and the normal send reports a real error. Linux only: macOS ignores `MSG_DONTWAIT` on a blocking socket and would wait with no deadline
+fn sendNow(handle: Io.net.Socket.Handle, header: []const u8, data: []const []const u8, splat: usize) ?usize {
+    if (builtin.os.tag != .linux) return null;
+    if (splat > 1) return null; // a repeated last slice: rare, leave it to `netWrite`
+
+    // the same bytes `netWrite` would send: `header`, then `data`, with the last slice sent `splat` (0 or 1) times
+    var iovecs: [16]posix.iovec_const = undefined;
+    var len: usize = 0;
+    const last = data.len - 1;
+    addIovec(&iovecs, &len, header);
+    for (data[0..last]) |bytes| addIovec(&iovecs, &len, bytes);
+    if (splat == 1) addIovec(&iovecs, &len, data[last]);
+    if (len == 0) return null;
+
+    const msg: posix.msghdr_const = .{
+        .name = null,
+        .namelen = 0,
+        .iov = &iovecs,
+        .iovlen = @intCast(len),
+        .control = null,
+        .controllen = 0,
+        .flags = 0,
+    };
+    const rc = posix.system.sendmsg(handle, &msg, posix.MSG.NOSIGNAL | posix.MSG.DONTWAIT);
+    return switch (posix.errno(rc)) {
+        .SUCCESS => @intCast(rc),
+        else => null,
+    };
+}
+
+/// adds `bytes` to the `len` iovecs in use, skipping empty slices. Once all are in use it adds nothing,
+/// so what's sent is always a prefix of the bytes, and the writer sends the rest later
+fn addIovec(iovecs: []posix.iovec_const, len: *usize, bytes: []const u8) void {
+    if (bytes.len == 0 or len.* == iovecs.len) return;
+    iovecs[len.*] = .{ .base = bytes.ptr, .len = bytes.len };
+    len.* += 1;
 }
 
 // Tests

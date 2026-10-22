@@ -1,0 +1,24 @@
+name=ziggurat
+url=http://127.0.0.1:3000/
+commit=cd4736e
+date=2026-10-21T05-26-33Z
+wrk_args=-t2 -c64 -d10s
+
+Running 10s test @ http://127.0.0.1:3000/
+  2 threads and 64 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency   229.70us    1.36ms  52.11ms   99.15%
+    Req/Sec   135.85k    22.66k  180.53k    86.14%
+  Latency Distribution
+     50%  140.00us
+     75%  183.00us
+     90%  226.00us
+     99%    1.33ms
+  2734201 requests in 9.87s, 365.06MB read
+  Socket errors: connect 0, read 0, write 0, timeout 19
+Requests/sec: 277036.09
+Transfer/sec:     36.99MB
+requests_per_sec=277036
+p50_us=140
+p99_us=1328
+errors=19
