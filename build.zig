@@ -81,4 +81,23 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| run_hello.addArgs(args);
     const hello_step = b.step("hello", "Run the hello example server");
     hello_step.dependOn(&run_hello.step);
+
+    // example static site: zig build static
+    const static_exe = b.addExecutable(.{
+        .name = "static",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("examples/static/main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "ziggurat", .module = mod },
+            },
+        }),
+    });
+    b.installArtifact(static_exe);
+    const run_static = b.addRunArtifact(static_exe);
+    if (b.args) |args| run_static.addArgs(args);
+    const static_step = b.step("static", "Run the static site example");
+    static_step.dependOn(&run_static.step);
+
 }
