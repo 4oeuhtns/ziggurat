@@ -99,5 +99,4 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| run_static.addArgs(args);
     const static_step = b.step("static", "Run the static site example");
     static_step.dependOn(&run_static.step);
-
 }

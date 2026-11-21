@@ -31,6 +31,6 @@ pub fn main(init: std.process.Init) !void {
 
 /// returns index.html
 fn index(_: *const z.http.Request, res: *z.http.Response) !void {
-    res.content_type = "text/html; charset=utf-8";
+    res.content_type = z.http.contentType("index.html");
     try res.send(page);
 }

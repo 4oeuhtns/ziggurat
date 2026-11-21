@@ -14,6 +14,7 @@ pub const Server = @import("http/server.zig").Server;
 pub const Options = @import("http/server.zig").Options;
 pub const serve = @import("http/server.zig").serve;
 pub const AccessLog = @import("http/AccessLog.zig");
+pub const contentType = @import("http/mime.zig").contentType;
 
 test {
     std.testing.refAllDecls(@This());
